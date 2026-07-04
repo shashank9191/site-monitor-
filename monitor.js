@@ -248,7 +248,14 @@ function renderText(results) {
 
 // ---- email ----------------------------------------------------------------
 async function sendEmail(subject, html, text) {
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+  // Trim defensively — pasted secrets often carry a stray space/newline, which
+  // makes SMTP_HOST fail DNS lookup (getaddrinfo ENOTFOUND). Gmail App Passwords
+  // are shown in 4-char groups, so strip all whitespace from the password too.
+  const host = (process.env.SMTP_HOST || '').trim();
+  const user = (process.env.SMTP_USER || '').trim();
+  const pass = (process.env.SMTP_PASS || '').replace(/\s+/g, '');
+  const port = parseInt((process.env.SMTP_PORT || '465').trim(), 10);
+  if (!host || !user || !pass) {
     console.log('\n[email] SMTP not configured — skipping send. (set SMTP_HOST/SMTP_USER/SMTP_PASS)');
     return false;
   }
@@ -256,15 +263,14 @@ async function sendEmail(subject, html, text) {
   try { nodemailer = require('nodemailer'); }
   catch { console.log('[email] nodemailer not installed — run: npm i nodemailer'); return false; }
 
+  console.log(`[email] sending via ${host}:${port} as ${user} -> ${(process.env.MAIL_TO || user).trim()}`);
   const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: parseInt(process.env.SMTP_PORT || '465', 10),
-    secure: parseInt(process.env.SMTP_PORT || '465', 10) === 465,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    host, port, secure: port === 465,
+    auth: { user, pass },
   });
   const info = await transporter.sendMail({
-    from: process.env.MAIL_FROM || process.env.SMTP_USER,
-    to: process.env.MAIL_TO || 'shashank@keyahomes.in',
+    from: (process.env.MAIL_FROM || user).trim(),
+    to: (process.env.MAIL_TO || 'shashank@keyahomes.in').trim(),
     subject, text, html,
   });
   console.log('[email] sent:', info.messageId);
@@ -299,12 +305,16 @@ async function sendEmail(subject, html, text) {
 
   const hasIssues = results.some(r => r.problems.length);
   const alwaysEmail = process.env.ALWAYS_EMAIL !== '0';
+  let emailOk = true;
   if (alwaysEmail || hasIssues) {
-    await sendEmail(subject, html, text).catch(e => console.log('[email] failed:', e.message));
+    emailOk = await sendEmail(subject, html, text).catch(e => { console.log('[email] failed:', e.message); return false; });
   } else {
     console.log('\n[email] no issues and ALWAYS_EMAIL=0 — not sending.');
   }
 
-  // non-zero exit on issues, handy for CI / schedulers
-  process.exit(hasIssues ? 1 : 0);
+  // Site problems (down/slow/chatbot) are reported *in the email*, not as a CI
+  // failure — otherwise every run with a minor issue would trigger a spurious
+  // "run failed" notification. The run only goes red on a genuine failure:
+  // the script crashing, or email delivery failing when it was supposed to send.
+  process.exit(emailOk ? 0 : 1);
 })().catch(e => { console.error('FATAL', e); process.exit(2); });
