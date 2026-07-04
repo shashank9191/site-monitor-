@@ -1,0 +1,45 @@
+name: Site Monitor
+
+# Runs twice a day (times are UTC). 03:30 & 09:30 UTC = 09:00 & 15:00 IST.
+on:
+  schedule:
+    - cron: '30 3 * * *'
+    - cron: '30 9 * * *'
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run monitor
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          ALWAYS_EMAIL: '1'
+        run: node monitor.js
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-report
+          path: reports/latest.html
+          if-no-files-found: ignore
