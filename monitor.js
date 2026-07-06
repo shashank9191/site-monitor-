@@ -32,6 +32,8 @@ async function checkSite(browser, site) {
     project: site.project,
     url: site.url,
     up: false,
+    broken: false,
+    title: null,
     httpStatus: null,
     ttfbMs: null,
     loadMs: null,
@@ -75,6 +77,28 @@ async function checkSite(browser, site) {
 
     // let JS-injected widgets (chatbot, whatsapp float) settle
     await page.waitForTimeout(6000);
+
+    // ---- content health: HTTP 200 does NOT mean the page rendered correctly.
+    // Catch broken deploys that still serve a 200 (unrendered template
+    // placeholders leaking into the page, empty title, near-empty body). ----
+    const title = (await page.title().catch(() => '')) || '';
+    r.title = title;
+    const bodyLen = await page.evaluate(
+      () => (document.body ? document.body.innerText : '').trim().length
+    ).catch(() => 0);
+    // Markers of an unrendered template / broken build.
+    const LEAK = /#site_?title|#site_|\{\{|\}\}|<%|%>|\bundefined\b|\bnull\b|\[object Object\]/i;
+    if (LEAK.test(title)) {
+      r.broken = true;
+      r.problems.push(`Page broken: template not rendering (title: "${title.slice(0, 50)}")`);
+    } else if (!title.trim()) {
+      r.broken = true;
+      r.problems.push('Page broken: empty <title>');
+    }
+    if (bodyLen < 200) {
+      r.broken = true;
+      r.problems.push(`Page broken: almost no content (${bodyLen} chars rendered)`);
+    }
 
     // ---- WhatsApp button ----
     const waHrefs = await page.$$eval(
@@ -185,7 +209,11 @@ function statusCell(ok, label) {
 
 function renderHtml(results, startedAt) {
   const rows = results.map(r => {
-    const upCell = r.up ? statusCell(true, 'Up') : statusCell(false, r.httpStatus ? 'HTTP ' + r.httpStatus : 'Down');
+    const upCell = !r.up
+      ? statusCell(false, r.httpStatus ? 'HTTP ' + r.httpStatus : 'Down')
+      : r.broken
+        ? `<span style="color:#e37400;font-weight:600">⚠ Broken (200)</span>`
+        : statusCell(true, 'Up');
     const ttfbStr = r.ttfbMs == null ? '—' : (r.ttfbMs / 1000).toFixed(1) + 's';
     const loadStr = r.loadMs == null ? '—' : (r.loadMs / 1000).toFixed(1) + 's';
     const speedCell = r.loadMs == null ? '—'
@@ -239,20 +267,25 @@ function renderHtml(results, startedAt) {
 function renderSubject(results) {
   const issues = results.filter(r => r.problems.length);
   if (issues.length === 0) return `✅ Site Monitor — all ${results.length} sites OK`;
-  const names = issues.slice(0, 3).map(r => r.url.replace('https://', '')).join(', ');
+  // Most severe first: down, then broken-but-200, then everything else.
+  const severity = r => (!r.up ? 0 : r.broken ? 1 : 2);
+  const sorted = [...issues].sort((a, b) => severity(a) - severity(b));
+  const critical = issues.some(r => !r.up || r.broken);
+  const names = sorted.slice(0, 3).map(r => r.url.replace('https://', '')).join(', ');
   const more = issues.length > 3 ? ` +${issues.length - 3} more` : '';
-  return `⚠️ Site Monitor — ${issues.length} issue${issues.length > 1 ? 's' : ''}: ${names}${more}`;
+  return `${critical ? '🔴' : '⚠️'} Site Monitor — ${issues.length} issue${issues.length > 1 ? 's' : ''}: ${names}${more}`;
 }
 
 function renderText(results) {
   return results.map(r => {
+    const state = !r.up ? 'DOWN' : r.broken ? 'BROKEN' : 'UP';
     const bits = [
-      r.up ? 'UP' : 'DOWN',
+      state,
       r.loadMs != null ? (r.loadMs / 1000).toFixed(1) + 's' : '-',
       'chat:' + (!r.chatbot.present ? 'missing' : r.chatbot.replied ? 'ok' : 'noreply'),
     ];
     const probs = r.problems.length ? '  !! ' + r.problems.join('; ') : '';
-    return `${r.up && !r.problems.length ? '✓' : '✗'} ${r.url}  [${bits.join(' ')}]${probs}`;
+    return `${r.up && !r.broken && !r.problems.length ? '✓' : '✗'} ${r.url}  [${bits.join(' ')}]${probs}`;
   }).join('\n');
 }
 
