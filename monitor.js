@@ -21,8 +21,9 @@ const SLOW_MS = parseInt(process.env.SLOW_MS || '12000', 10);   // full page loa
 const TTFB_SLOW_MS = parseInt(process.env.TTFB_SLOW_MS || '4000', 10); // server response
 // Default to sequential so load-time numbers aren't inflated by bandwidth contention.
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '1', 10);
-const NAV_TIMEOUT = 45000;
-const CHAT_WAIT_MS = 35000;      // how long to wait for a bot reply
+const NAV_TIMEOUT = 60000;       // slow (esp. from remote runners) sites need headroom
+const CHAT_WAIT_MS = 45000;      // how long to wait for a bot reply
+const WIDGET_WAIT_MS = 20000;    // how long to wait for the chat widget to inject
 const TEST_MESSAGE = 'Hello, this is an automated website health check. What projects do you have?';
 
 // ---- one site check -------------------------------------------------------
@@ -110,41 +111,50 @@ async function finish(r, context) {
 }
 
 async function runChatbotTest(page, r) {
-  // widget present?
-  const toggle = await page.$('#bzai-chat-toggle');
+  // Wait for the widget to inject — on slow (remote-runner) loads the toggle
+  // can take many seconds to appear, so don't declare it missing prematurely.
+  let toggle = null;
+  try {
+    await page.waitForSelector('#bzai-chat-toggle', { timeout: WIDGET_WAIT_MS });
+    toggle = await page.$('#bzai-chat-toggle');
+  } catch { /* stays null */ }
   if (!toggle) {
     r.problems.push('Chatbot widget not found');
     return;
   }
   r.chatbot.present = true;
 
+  const inputSel = '#bzai-chat-form input';
   try {
     await toggle.click();
-    await page.waitForSelector('#bzai-chat-form input', { timeout: 8000 });
+    await page.waitForSelector(inputSel, { timeout: 10000 });
 
     // how many bot bubbles already exist (greeting etc.)
     const botBefore = await page.$$eval('.bzai-message-bubble.bot', els => els.length).catch(() => 0);
 
-    const inputSel = '#bzai-chat-form input';
-    await page.fill(inputSel, TEST_MESSAGE);
-    await page.press(inputSel, 'Enter');
+    // Send the message; if no reply arrives, resend once before giving up
+    // (guards against a dropped first message on a slow connection).
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await page.fill(inputSel, TEST_MESSAGE).catch(() => {});
+      await page.press(inputSel, 'Enter').catch(() => {});
 
-    // poll for a NEW bot bubble with real content
-    const deadline = Date.now() + CHAT_WAIT_MS;
-    while (Date.now() < deadline) {
-      await page.waitForTimeout(1000);
-      const bubbles = await page.$$eval('.bzai-message-bubble.bot',
-        els => els.map(e => (e.innerText || '').trim())).catch(() => []);
-      if (bubbles.length > botBefore) {
-        const latest = bubbles[bubbles.length - 1];
-        if (latest && latest.length > 5) {
-          r.chatbot.replied = true;
-          r.chatbot.replyPreview = latest.slice(0, 120);
-          return;
+      const deadline = Date.now() + CHAT_WAIT_MS;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(1000);
+        const bubbles = await page.$$eval('.bzai-message-bubble.bot',
+          els => els.map(e => (e.innerText || '').trim())).catch(() => []);
+        if (bubbles.length > botBefore) {
+          const latest = bubbles[bubbles.length - 1];
+          if (latest && latest.length > 5) {
+            r.chatbot.replied = true;
+            r.chatbot.replyPreview = latest.slice(0, 120);
+            return;
+          }
         }
       }
+      if (attempt === 1) await page.waitForTimeout(2000);
     }
-    r.problems.push('Chatbot did not reply within ' + (CHAT_WAIT_MS / 1000) + 's');
+    r.problems.push(`Chatbot did not reply within ${CHAT_WAIT_MS / 1000}s (2 attempts)`);
   } catch (e) {
     r.problems.push('Chatbot test failed: ' + e.message.split('\n')[0].slice(0, 80));
   }
@@ -285,6 +295,17 @@ async function sendEmail(subject, html, text) {
   let results;
   try {
     results = await runPool(browser, SITES, CONCURRENCY);
+
+    // Re-verify any flagged site once. Remote runners are far from the sites,
+    // so a cold/contended load or a slow chatbot round-trip can produce a
+    // one-off false positive; a calmer second check filters most of these out.
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].problems.length) {
+        process.stdout.write(`  re-checking ${results[i].url} (had: ${results[i].problems.join('; ')}) ...\n`);
+        const retry = await checkSite(browser, SITES[i]);
+        if (retry.problems.length <= results[i].problems.length) results[i] = retry;
+      }
+    }
   } finally {
     await browser.close();
   }
