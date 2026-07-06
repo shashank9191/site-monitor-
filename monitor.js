@@ -290,8 +290,8 @@ function renderHtml(results, startedAt) {
     </table>
     ${renderShots(results)}
     <div style="color:#5f6368;font-size:12px;margin-top:16px">
-      Speed flagged above ${(SLOW_MS / 1000)}s · Chatbot tested by sending: "${TEST_MESSAGE}"
-      · SSL & www/redirect checked per domain
+      Speed measured from a US server (GitHub) — India visitors see faster; flagged above ${(SLOW_MS / 1000)}s.
+      · Chatbot tested by sending: "${TEST_MESSAGE}" · SSL & www/redirect checked per domain
     </div>
   </div>`;
 }

@@ -35,6 +35,10 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
           ALWAYS_EMAIL: '1'
+          # GitHub runners are in the US; India-hosted sites load ~2x slower from
+          # there, so use higher slow-thresholds to flag only genuinely bad sites.
+          SLOW_MS: '20000'
+          TTFB_SLOW_MS: '5000'
         run: node monitor.js
 
       - name: Upload HTML report
