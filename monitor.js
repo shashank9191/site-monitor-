@@ -16,6 +16,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const SITES = require('./sites');
+const { domainHealth } = require('./netchecks');
 
 const SLOW_MS = parseInt(process.env.SLOW_MS || '12000', 10);   // full page load
 const TTFB_SLOW_MS = parseInt(process.env.TTFB_SLOW_MS || '4000', 10); // server response
@@ -39,6 +40,11 @@ async function checkSite(browser, site) {
     loadMs: null,
     finalUrl: null,
     slow: false,
+    ssl: null,
+    www: null,
+    httpsRedirect: null,
+    shotPath: null,
+    _cid: null,
     whatsapp: { expected: site.wa, found: null, ok: null },
     chatbot: { present: false, replied: false, replyPreview: null },
     notes: [],
@@ -67,6 +73,22 @@ async function checkSite(browser, site) {
     r.finalUrl = page.url();
     r.httpStatus = resp ? resp.status() : null;
     r.up = !!resp && resp.status() < 400;
+
+    // ---- domain-level checks (SSL expiry, www resolves, http->https) ----
+    // Independent of page render, so run even when the page itself is down.
+    try {
+      const dh = await domainHealth(new URL(site.url).hostname);
+      r.ssl = dh.sslDays;
+      r.www = dh.wwwOk;
+      r.httpsRedirect = !!(dh.redirect && dh.redirect.toHttps);
+      if (dh.sslDays != null && dh.sslDays < 0) r.problems.push('SSL certificate EXPIRED');
+      else if (dh.sslDays != null && dh.sslDays < 21) r.problems.push(`SSL expiring in ${dh.sslDays} days`);
+      if (dh.wwwOk === false) r.problems.push(`www.${dh.apex} does not resolve (www visitors get nothing)`);
+      if (dh.redirect && dh.redirect.status && !dh.redirect.toHttps) {
+        r.problems.push(`http:// not redirecting to https (returns ${dh.redirect.status})`);
+      }
+    } catch { /* domain checks best-effort */ }
+
     if (!r.up) { r.problems.push(`HTTP ${r.httpStatus || 'no response'}`); return finish(r, context); }
 
     const slowLoad = r.loadMs > SLOW_MS;
@@ -122,6 +144,14 @@ async function checkSite(browser, site) {
 
     // ---- AI chatbot: open, send a message, confirm a reply ----
     await runChatbotTest(page, r);
+
+    // ---- screenshot flagged sites so the email SHOWS what's wrong ----
+    if (r.problems.length) {
+      const shot = path.join(__dirname, 'reports', `shot-${new URL(site.url).hostname}.jpg`);
+      const ok = await page.screenshot({ path: shot, type: 'jpeg', quality: 55 })
+        .then(() => true).catch(() => false);
+      if (ok) r.shotPath = shot;
+    }
 
   } catch (e) {
     r.problems.push(`Error: ${e.message.split('\n')[0].slice(0, 120)}`);
@@ -258,9 +288,28 @@ function renderHtml(results, startedAt) {
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>
+    ${renderShots(results)}
     <div style="color:#5f6368;font-size:12px;margin-top:16px">
       Speed flagged above ${(SLOW_MS / 1000)}s · Chatbot tested by sending: "${TEST_MESSAGE}"
+      · SSL & www/redirect checked per domain
     </div>
+  </div>`;
+}
+
+// Inline screenshots of flagged sites (embedded via Content-ID attachments).
+function renderShots(results) {
+  const shots = results.filter(r => r._cid);
+  if (!shots.length) return '';
+  const cards = shots.map(r => `
+    <div style="margin-top:14px">
+      <div style="font-size:13px;font-weight:600;color:#202124;margin-bottom:4px">
+        ${r.url.replace('https://', '')} — ${!r.up ? 'DOWN' : r.broken ? 'BROKEN' : 'flagged'}
+      </div>
+      <img src="cid:${r._cid}" alt="${r.url}" style="max-width:100%;border:1px solid #e0e0e0;border-radius:6px"/>
+    </div>`).join('');
+  return `<div style="margin-top:24px">
+    <h3 style="margin:0 0 4px;font-size:15px">Screenshots of flagged sites</h3>
+    ${cards}
   </div>`;
 }
 
@@ -290,7 +339,7 @@ function renderText(results) {
 }
 
 // ---- email ----------------------------------------------------------------
-async function sendEmail(subject, html, text) {
+async function sendEmail(subject, html, text, attachments) {
   // Trim defensively — pasted secrets often carry a stray space/newline, which
   // makes SMTP_HOST fail DNS lookup (getaddrinfo ENOTFOUND). Gmail App Passwords
   // are shown in 4-char groups, so strip all whitespace from the password too.
@@ -315,19 +364,58 @@ async function sendEmail(subject, html, text) {
     from: (process.env.MAIL_FROM || user).trim(),
     to: (process.env.MAIL_TO || 'shashank@keyahomes.in').trim(),
     subject, text, html,
+    attachments: attachments && attachments.length ? attachments : undefined,
   });
   console.log('[email] sent:', info.messageId);
   return true;
+}
+
+// ---- Google Sheets trend log (optional) -----------------------------------
+// If SHEETS_WEBHOOK_URL is set (an Apps Script Web App URL), POST one row per
+// site so you can track uptime/speed/chatbot health over time in a Sheet.
+async function logToSheet(results, startedAt) {
+  const url = (process.env.SHEETS_WEBHOOK_URL || '').trim();
+  if (!url) return;
+  const rows = results.map(r => ({
+    time: startedAt,
+    project: r.project,
+    url: r.url,
+    status: !r.up ? 'DOWN' : r.broken ? 'BROKEN' : 'UP',
+    ttfbMs: r.ttfbMs,
+    loadMs: r.loadMs,
+    whatsapp: r.whatsapp.found || '',
+    chatbot: !r.chatbot.present ? 'missing' : r.chatbot.replied ? 'ok' : 'noreply',
+    sslDays: r.ssl,
+    www: r.www,
+    problems: r.problems.join(' | '),
+  }));
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runAt: startedAt, rows }),
+    });
+    console.log('[sheets] logged', rows.length, 'rows —', res.status);
+  } catch (e) {
+    console.log('[sheets] failed:', e.message);
+  }
 }
 
 // ---- main -----------------------------------------------------------------
 (async () => {
   const startedAt = new Date().toString();
   console.log('Site monitor run —', startedAt);
+  const outDir = path.join(__dirname, 'reports');
+  fs.mkdirSync(outDir, { recursive: true });
+  // Optional ONLY=substr,substr filter for targeted/test runs.
+  const sites = process.env.ONLY
+    ? SITES.filter(s => process.env.ONLY.split(',').some(x => s.url.includes(x.trim())))
+    : SITES;
+
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
   let results;
   try {
-    results = await runPool(browser, SITES, CONCURRENCY);
+    results = await runPool(browser, sites, CONCURRENCY);
 
     // Re-verify any flagged site once. Remote runners are far from the sites,
     // so a cold/contended load or a slow chatbot round-trip can produce a
@@ -335,13 +423,21 @@ async function sendEmail(subject, html, text) {
     for (let i = 0; i < results.length; i++) {
       if (results[i].problems.length) {
         process.stdout.write(`  re-checking ${results[i].url} (had: ${results[i].problems.join('; ')}) ...\n`);
-        const retry = await checkSite(browser, SITES[i]);
+        const retry = await checkSite(browser, sites[i]);
         if (retry.problems.length <= results[i].problems.length) results[i] = retry;
       }
     }
   } finally {
     await browser.close();
   }
+
+  // Attach a screenshot for each flagged site (cap at 6 to keep the email light),
+  // embedded inline in the report via a Content-ID.
+  const attachments = [];
+  results.filter(r => r.shotPath).slice(0, 6).forEach((r, i) => {
+    r._cid = `shot${i}`;
+    attachments.push({ filename: new URL(r.url).hostname + '.jpg', path: r.shotPath, cid: r._cid });
+  });
 
   const html = renderHtml(results, startedAt);
   const subject = renderSubject(results);
@@ -351,8 +447,6 @@ async function sendEmail(subject, html, text) {
   console.log(text);
 
   // always write a local report artifact
-  const outDir = path.join(__dirname, 'reports');
-  fs.mkdirSync(outDir, { recursive: true });
   const stamp = startedAt.replace(/[^0-9]/g, '').slice(0, 14);
   fs.writeFileSync(path.join(outDir, `report-${stamp}.html`), html);
   fs.writeFileSync(path.join(outDir, 'latest.html'), html);
@@ -361,10 +455,12 @@ async function sendEmail(subject, html, text) {
   const alwaysEmail = process.env.ALWAYS_EMAIL !== '0';
   let emailOk = true;
   if (alwaysEmail || hasIssues) {
-    emailOk = await sendEmail(subject, html, text).catch(e => { console.log('[email] failed:', e.message); return false; });
+    emailOk = await sendEmail(subject, html, text, attachments).catch(e => { console.log('[email] failed:', e.message); return false; });
   } else {
     console.log('\n[email] no issues and ALWAYS_EMAIL=0 — not sending.');
   }
+
+  await logToSheet(results, startedAt);
 
   // Site problems (down/slow/chatbot) are reported *in the email*, not as a CI
   // failure — otherwise every run with a minor issue would trigger a spurious
